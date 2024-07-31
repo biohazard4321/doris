@@ -473,7 +473,10 @@ public class SessionVariable implements Serializable, Writable {
     public static final String EXTERNAL_TABLE_ANALYZE_PART_NUM = "external_table_analyze_part_num";
 
     public static final String ENABLE_STRONG_CONSISTENCY = "enable_strong_consistency_read";
+
     public static final String GROUP_COMMIT = "group_commit";
+
+    public static final String ENABLE_PREPARED_STMT_AUDIT_LOG = "enable_prepared_stmt_audit_log";
 
     public static final String PARALLEL_SYNC_ANALYZE_TASK_NUM = "parallel_sync_analyze_task_num";
 
@@ -728,9 +731,10 @@ public class SessionVariable implements Serializable, Writable {
     @VariableMgr.VarAttr(name = ENABLE_PROFILE, needForward = true)
     public boolean enableProfile = false;
 
-    // if true, need report to coordinator when plan fragment execute successfully.
+    // When enable_profile is true, profile of queries that costs more than autoProfileThresholdMs
+    // will be stored to disk.
     @VariableMgr.VarAttr(name = AUTO_PROFILE_THRESHOLD_MS, needForward = true)
-    public int autoProfileThresholdMs = -1;
+    public int autoProfileThresholdMs = 500;
 
     @VariableMgr.VarAttr(name = "runtime_filter_prune_for_external")
     public boolean runtimeFilterPruneForExternal = true;
@@ -840,7 +844,7 @@ public class SessionVariable implements Serializable, Writable {
     public String timeZone = TimeUtils.getSystemTimeZone().getID();
 
     @VariableMgr.VarAttr(name = PARALLEL_EXCHANGE_INSTANCE_NUM)
-    public int exchangeInstanceParallel = -1;
+    public int exchangeInstanceParallel = 100;
 
     @VariableMgr.VarAttr(name = SQL_SAFE_UPDATES)
     public int sqlSafeUpdates = 0;
@@ -1070,7 +1074,7 @@ public class SessionVariable implements Serializable, Writable {
     private int runtimeBloomFilterSize = 2097152;
 
     @VariableMgr.VarAttr(name = RUNTIME_BLOOM_FILTER_MIN_SIZE, needForward = true)
-    private int runtimeBloomFilterMinSize = 2048;
+    private int runtimeBloomFilterMinSize = 1048576;
 
     @VariableMgr.VarAttr(name = RUNTIME_BLOOM_FILTER_MAX_SIZE, needForward = true)
     private int runtimeBloomFilterMaxSize = 16777216;
@@ -1678,6 +1682,9 @@ public class SessionVariable implements Serializable, Writable {
     @VariableMgr.VarAttr(name = GROUP_COMMIT, needForward = true)
     public String groupCommit = "off_mode";
 
+    @VariableMgr.VarAttr(name = ENABLE_PREPARED_STMT_AUDIT_LOG, needForward = true)
+    public boolean enablePreparedStmtAuditLog = true;
+
     @VariableMgr.VarAttr(name = INVERTED_INDEX_CONJUNCTION_OPT_THRESHOLD,
             description = {"在match_all中求取多个倒排索引的交集时,如果最大的倒排索引中的总数是最小倒排索引中的总数的整数倍,"
                     + "则使用跳表来优化交集操作。",
@@ -2113,10 +2120,14 @@ public class SessionVariable implements Serializable, Writable {
             this.rewriteOrToInPredicateThreshold = 100000;
             this.enableFunctionPushdown = false;
             this.enableDeleteSubPredicateV2 = false;
+            this.topnOptLimitThreshold = 0;
+            this.enableSyncRuntimeFilterSize = true;
         } else {
             this.rewriteOrToInPredicateThreshold = 2;
             this.enableFunctionPushdown = true;
             this.enableDeleteSubPredicateV2 = true;
+            this.topnOptLimitThreshold = 1024;
+            this.enableSyncRuntimeFilterSize = false;
         }
 
         /*
@@ -2166,6 +2177,7 @@ public class SessionVariable implements Serializable, Writable {
             switch (Config.pull_request_id % 3) {
                 case 0:
                     this.fragmentTransmissionCompressionCodec = "snappy";
+                    this.runtimeFilterWaitTimeMs = 10;
                     break;
                 case 1:
                     this.fragmentTransmissionCompressionCodec = "lz4";
@@ -2180,10 +2192,12 @@ public class SessionVariable implements Serializable, Writable {
                 case 0:
                     this.parallelScanMaxScannersCount = 32;
                     this.parallelScanMinRowsPerScanner = 64;
+                    this.runtimeFilterMaxInNum = 10;
                     break;
                 case 1:
                     this.parallelScanMaxScannersCount = 16;
                     this.parallelScanMinRowsPerScanner = 128;
+                    this.runtimeFilterMaxInNum = 0;
                     break;
                 case 2:
                     this.parallelScanMaxScannersCount = 8;
@@ -3250,20 +3264,21 @@ public class SessionVariable implements Serializable, Writable {
     public Set<String> getDisableNereidsRuleNames() {
         String checkPrivilege = RuleType.CHECK_PRIVILEGES.name();
         String checkRowPolicy = RuleType.CHECK_ROW_POLICY.name();
-        return Arrays.stream(disableNereidsRules.split(",[\\s]*"))
-                .map(rule -> rule.toUpperCase(Locale.ROOT))
-                .filter(rule -> !StringUtils.equalsIgnoreCase(rule, checkPrivilege)
+        return Arrays.stream(disableNereidsRules.split(","))
+                .map(rule -> rule.trim().toUpperCase(Locale.ROOT))
+                .filter(rule -> !rule.isEmpty()
+                        && !StringUtils.equalsIgnoreCase(rule, checkPrivilege)
                         && !StringUtils.equalsIgnoreCase(rule, checkRowPolicy))
                 .collect(ImmutableSet.toImmutableSet());
     }
 
     public BitSet getDisableNereidsRules() {
         BitSet bitSet = new BitSet();
-        for (String ruleName : disableNereidsRules.split(",[\\s]*")) {
+        for (String ruleName : disableNereidsRules.split(",")) {
+            ruleName = ruleName.trim().toUpperCase(Locale.ROOT);
             if (ruleName.isEmpty()) {
                 continue;
             }
-            ruleName = ruleName.toUpperCase(Locale.ROOT);
             RuleType ruleType = RuleType.valueOf(ruleName);
             if (ruleType == RuleType.CHECK_PRIVILEGES || ruleType == RuleType.CHECK_ROW_POLICY) {
                 continue;
@@ -3560,6 +3575,7 @@ public class SessionVariable implements Serializable, Writable {
 
         tResult.setRuntimeFilterWaitTimeMs(runtimeFilterWaitTimeMs);
         tResult.setRuntimeFilterMaxInNum(runtimeFilterMaxInNum);
+        tResult.setRuntimeBloomFilterMinSize(runtimeBloomFilterMinSize);
         tResult.setRuntimeFilterWaitInfinitely(runtimeFilterWaitInfinitely);
 
         if (cpuResourceLimit > 0) {
@@ -4120,6 +4136,10 @@ public class SessionVariable implements Serializable, Writable {
             return "sync_mode";
         }
         return groupCommit;
+    }
+
+    public boolean isEnablePreparedStmtAuditLog() {
+        return enablePreparedStmtAuditLog;
     }
 
     public boolean isEnableMaterializedViewRewrite() {
